@@ -227,6 +227,15 @@ proc cluster_setup {masters replicas node_count slot_allocator replica_allocator
     # Setup master/replica relationships
     $replica_allocator $masters $replicas
 
+    # A helper debug log that can print the server id in the server logs.
+    # This can help us locate the corresponding server in the log file.
+    for {set i 0} {$i < $masters} {incr i} {
+        R $i DEBUG LOG "========== I am primary $i =========="
+    }
+    for {set i $i} {$i < [expr $masters+$replicas]} {incr i} {
+        R $i DEBUG LOG "========== I am replica $i =========="
+    }
+
     wait_for_cluster_propagation
     wait_for_cluster_state "ok"
 
@@ -337,6 +346,27 @@ proc are_hostnames_propagated {match_string} {
         foreach node $cfg {
             for {set i 2} {$i < [llength $node]} {incr i} {
                 if {! [string match $match_string [lindex [lindex [lindex $node $i] 3] 1]] } {
+                    return 0
+                }
+            }
+        }
+    }
+    return 1
+}
+
+# Check if cluster's announced IPs are consistent and match a pattern
+# Optionally, a list of clients can be supplied.
+proc are_cluster_announced_ips_propagated {match_string {clients {}}} {
+    for {set j 0} {$j < [llength $::servers]} {incr j} {
+        if {$clients eq {}} {
+            set client [srv [expr -1*$j] "client"]
+        } else {
+            set client [lindex $clients $j]
+        }
+        set cfg [$client cluster slots]
+        foreach node $cfg {
+            for {set i 2} {$i < [llength $node]} {incr i} {
+                if {! [string match $match_string [lindex [lindex $node $i] 0]] } {
                     return 0
                 }
             }

@@ -330,7 +330,7 @@ start_server {tags {"info" "external:skip"}} {
             if {$::verbose} { puts "eventloop metrics cmd_sum1: $cmd_sum1, cmd_sum2: $cmd_sum2" }
             assert_morethan $cmd_sum2 $cmd_sum1
             assert_lessthan $cmd_sum2 [expr $cmd_sum1+15000] ;# we expect about tens of ms here, but allow some tolerance
-        }
+        } {} {io-threads:skip} ; # skip with io-threads as the eventloop metrics are different in that case.
 
         test {stats: instantaneous metrics} {
             r config resetstat
@@ -349,7 +349,8 @@ start_server {tags {"info" "external:skip"}} {
             if {$::verbose} { puts "instantaneous metrics instantaneous_eventloop_duration_usec: $value" }
             assert_morethan $value 0
             assert_lessthan $value [expr $retries*22000] ;# default hz is 10, so duration < 1000 / 10, allow some tolerance
-        }
+        } {} {io-threads:skip} ; # skip with io-threads as the eventloop metrics are different in that case.
+        
 
         test {stats: debug metrics} {
             # make sure debug info is hidden
@@ -423,7 +424,8 @@ start_server {tags {"info" "external:skip"}} {
             set info [r info clients]
             assert_equal [getInfoProperty $info pubsub_clients] {1}
             # non-pubsub clients should not be involved
-            assert_equal {0} [unsubscribe $rd2 {non-exist-chan}]
+            catch {unsubscribe $rd2 {non-exist-chan}} e
+            assert_match {*NOSUB*} $e
             set info [r info clients]
             assert_equal [getInfoProperty $info pubsub_clients] {1}
             # close all clients

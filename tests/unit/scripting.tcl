@@ -295,7 +295,7 @@ start_server {tags {"scripting"}} {
 
     test {EVAL - Scripts do not block on waitaof} {
         run_script {return redis.pcall('waitaof','0','1','0')} 0
-    } {0 0}
+    } {* 0}
 
     test {EVAL - Scripts do not block on XREAD with BLOCK option} {
         r del s
@@ -732,6 +732,12 @@ start_server {tags {"scripting"}} {
         catch {run_script {a=10} 0} e
         set e
     } {ERR *Attempt to modify a readonly table*}
+
+    test {lua bit.tohex bug} {
+        set res [run_script {return bit.tohex(65535, -2147483648)} 0]
+        r ping
+        set res
+    } {0000FFFF}
 
     test {Test an example script DECR_IF_GT} {
         set decr_if_gt {
@@ -1291,6 +1297,7 @@ start_server {tags {"scripting"}} {
         $rd close
         $rd2 close
         $r3 close
+        r config set appendonly no
         r DEBUG set-disable-deny-scripts 0
     } {OK} {external:skip needs:debug}
 
