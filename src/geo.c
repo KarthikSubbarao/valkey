@@ -1030,9 +1030,12 @@ static dictType uint64ClusterDictType = {
 static int geoClusterSortDesc(const void *a, const void *b) {
     const geoCluster *ca = *(const geoCluster **)a;
     const geoCluster *cb = *(const geoCluster **)b;
-    if (ca->count < cb->count) return 1;
-    else if (ca->count > cb->count) return -1;
-    else return 0;
+    if (ca->count < cb->count)
+        return 1;
+    else if (ca->count > cb->count)
+        return -1;
+    else
+        return 0;
 }
 
 static void addGeoClusterReply(client *c, geoCluster *cl, int precision) {
@@ -1150,7 +1153,7 @@ void geoclusterCommand(client *c) {
     int clusterCount = dictSize(clusterDict);
     if (maxcount > 0) {
         /* Extract clusters to array and sort by size DESC */
-        geoCluster **clusters = zmalloc(clusterCount * sizeof(geoCluster*));
+        geoCluster **clusters = zmalloc(clusterCount * sizeof(geoCluster *));
         dictIterator *di = dictGetIterator(clusterDict);
         dictEntry *de;
         int i = 0;
@@ -1158,7 +1161,7 @@ void geoclusterCommand(client *c) {
             clusters[i++] = dictGetVal(de);
         }
         dictReleaseIterator(di);
-        qsort(clusters, clusterCount, sizeof(geoCluster*), geoClusterSortDesc);
+        qsort(clusters, clusterCount, sizeof(geoCluster *), geoClusterSortDesc);
         /* Output top maxcount clusters */
         int outputCount = (maxcount < clusterCount) ? maxcount : clusterCount;
         addReplyArrayLen(c, outputCount);
