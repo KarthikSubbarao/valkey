@@ -1026,7 +1026,33 @@ static dictType uint64ClusterDictType = {
     NULL             /* expand allowed */
 };
 
-static void processPointForClustering(double *xy, int precision, dict *clusterDict) {
+/* Sort comparator for geo clusters by count (descending) */
+static int geoClusterSortDesc(const void *a, const void *b) {
+    const geoCluster *ca = *(const geoCluster **)a;
+    const geoCluster *cb = *(const geoCluster **)b;
+    if (ca->count < cb->count) return 1;
+    else if (ca->count > cb->count) return -1;
+    else return 0;
+}
+
+static void addGeoClusterReply(client *c, geoCluster *cl, int precision) {
+    char *geoalphabet = "0123456789bcdefghjkmnpqrstuvwxyz";
+    addReplyArrayLen(c, 4);
+    /* Generate Base32 geohash from truncated hash */
+    char geohash[12];
+    uint64_t hash_bits = cl->hash;
+    for (int idx = precision - 1; idx >= 0; idx--) {
+        geohash[idx] = geoalphabet[hash_bits & 0x1f];
+        hash_bits >>= GEOHASH_BITS_PER_CHAR;
+    }
+    geohash[precision] = '\0';
+    addReplyBulkCString(c, geohash);
+    addReplyLongLong(c, cl->count);
+    addReplyHumanLongDouble(c, cl->lon);
+    addReplyHumanLongDouble(c, cl->lat);
+}
+
+static void geoProcessPointForClustering(double *xy, int precision, dict *clusterDict) {
     GeoHashBits hash;
     geohashEncodeWGS84(xy[0], xy[1], GEO_STEP_MAX, &hash);
     GeoHashFix52Bits bits = geohashAlign52Bits(hash);
@@ -1045,7 +1071,7 @@ static void processPointForClustering(double *xy, int precision, dict *clusterDi
     }
 }
 
-/* GEOCLUSTER key PRECISION <1-12> [COUNT <max-clusters>]
+/* GEOCLUSTER key PRECISION <1-11> [COUNT <max-clusters>]
  *
  * Clusters points in a geospatial index using geohash-based clustering.
  * Returns an array of clusters, each containing the geohash and member count. */
@@ -1065,8 +1091,8 @@ void geoclusterCommand(client *c) {
         }
         long long prec;
         if (getLongLongFromObjectOrReply(c, c->argv[i], &prec, NULL) != C_OK) return;
-        if (prec < 1 || prec > 12) {
-            addReplyError(c, "PRECISION must be between 1 and 12");
+        if (prec < 1 || prec > 11) {
+            addReplyError(c, "PRECISION must be between 1 and 11");
             return;
         }
         precision = (int)prec;
@@ -1105,7 +1131,7 @@ void geoclusterCommand(client *c) {
             double score = zzlGetScore(sptr);
             double xy[2];
             if (decodeGeohash(score, xy)) {
-                processPointForClustering(xy, precision, clusterDict);
+                geoProcessPointForClustering(xy, precision, clusterDict);
             }
             eptr = lpNext(zl, sptr);
         }
@@ -1115,37 +1141,41 @@ void geoclusterCommand(client *c) {
         while (ln) {
             double xy[2];
             if (decodeGeohash(ln->score, xy)) {
-                processPointForClustering(xy, precision, clusterDict);
+                geoProcessPointForClustering(xy, precision, clusterDict);
             }
             ln = ln->level[0].forward;
         }
     }
-    /* Get clusters and limit if requested */
+    /* Get clusters and sort if COUNT specified */
     int clusterCount = dictSize(clusterDict);
-    if (maxcount > 0 && clusterCount > maxcount) clusterCount = maxcount;
-    addReplyArrayLen(c, clusterCount);
-    char *geoalphabet = "0123456789bcdefghjkmnpqrstuvwxyz";
-    dictIterator *di = dictGetIterator(clusterDict);
-    dictEntry *de;
-    int j = 0;
-    while ((de = dictNext(di)) != NULL && j < clusterCount) {
-        geoCluster *cl = dictGetVal(de);
-        addReplyArrayLen(c, 4);
-        /* Generate Base32 geohash from truncated hash */
-        char geohash[13];
-        uint64_t hash_bits = cl->hash;
-        for (int idx = precision - 1; idx >= 0; idx--) {
-            geohash[idx] = geoalphabet[hash_bits & 0x1f];
-            hash_bits >>= GEOHASH_BITS_PER_CHAR;
+    if (maxcount > 0) {
+        /* Extract clusters to array and sort by size DESC */
+        geoCluster **clusters = zmalloc(clusterCount * sizeof(geoCluster*));
+        dictIterator *di = dictGetIterator(clusterDict);
+        dictEntry *de;
+        int i = 0;
+        while ((de = dictNext(di)) != NULL) {
+            clusters[i++] = dictGetVal(de);
         }
-        geohash[precision] = '\0';
-        addReplyBulkCString(c, geohash);
-        addReplyLongLong(c, cl->count);
-        addReplyHumanLongDouble(c, cl->lon);
-        addReplyHumanLongDouble(c, cl->lat);
-        j++;
+        dictReleaseIterator(di);
+        qsort(clusters, clusterCount, sizeof(geoCluster*), geoClusterSortDesc);
+        /* Output top maxcount clusters */
+        int outputCount = (maxcount < clusterCount) ? maxcount : clusterCount;
+        addReplyArrayLen(c, outputCount);
+        for (int j = 0; j < outputCount; j++) {
+            addGeoClusterReply(c, clusters[j], precision);
+        }
+        zfree(clusters);
+    } else {
+        /* Fast path: direct dict iteration */
+        addReplyArrayLen(c, clusterCount);
+        dictIterator *di = dictGetIterator(clusterDict);
+        dictEntry *de;
+        while ((de = dictNext(di)) != NULL) {
+            addGeoClusterReply(c, dictGetVal(de), precision);
+        }
+        dictReleaseIterator(di);
     }
-    dictReleaseIterator(di);
     /* Cleanup hash table */
     dictRelease(clusterDict);
 }
