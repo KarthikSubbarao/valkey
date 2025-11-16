@@ -1013,7 +1013,7 @@ typedef struct {
 
 /* Hash function for uint64_t keys stored as pointers */
 static uint64_t dictUInt64Hash(const void *key) {
-    return (uint64_t)key;
+    return (uintptr_t)key;
 }
 
 /* Dict type for uint64_t -> geoCluster* mapping */
@@ -1031,7 +1031,7 @@ static void processPointForClustering(double *xy, int precision, dict *clusterDi
     geohashEncodeWGS84(xy[0], xy[1], GEO_STEP_MAX, &hash);
     GeoHashFix52Bits bits = geohashAlign52Bits(hash);
     uint64_t truncated_hash = bits >> ((GEO_STEP_MAX * 2) - precision * GEOHASH_BITS_PER_CHAR);
-    dictEntry *entry = dictFind(clusterDict, (void*)truncated_hash);
+    dictEntry *entry = dictFind(clusterDict, (void*)(uintptr_t)truncated_hash);
     if (entry) {
         geoCluster *c = dictGetVal(entry);
         c->count++;
@@ -1041,7 +1041,7 @@ static void processPointForClustering(double *xy, int precision, dict *clusterDi
         c->count = 1;
         c->lon = xy[0];
         c->lat = xy[1];
-        dictAdd(clusterDict, (void*)truncated_hash, c);
+        dictAdd(clusterDict, (void*)(uintptr_t)truncated_hash, c);
     }
 }
 
