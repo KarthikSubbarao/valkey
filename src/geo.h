@@ -22,4 +22,7 @@ typedef struct geoArray {
     struct geoPoint arraybuf[MAX_GEO_ARRAY_BUFFER]; /* Pre-allocated buffer reduces heap allocation */
 } geoArray;
 
+/* Function declarations */
+void geoclusterCommand(client *c);
+
 #endif

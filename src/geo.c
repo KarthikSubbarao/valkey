@@ -1002,3 +1002,136 @@ void geodistCommand(client *c) {
     else
         addReplyDoubleDistance(c, geohashGetDistance(xyxy[0], xyxy[1], xyxy[2], xyxy[3]) / to_meter);
 }
+
+#define GEOHASH_BITS_PER_CHAR 5
+
+typedef struct {
+    uint64_t hash;
+    long long count;
+    double lon, lat;
+} cluster;
+
+static void processPointForClustering(double *xy, int precision, cluster **clusters, int *clusterCount, int *clusterCapacity) {
+    GeoHashBits hash;
+    geohashEncodeWGS84(xy[0], xy[1], GEO_STEP_MAX, &hash);
+    GeoHashFix52Bits bits = geohashAlign52Bits(hash);
+    uint64_t truncated_hash = bits >> ((GEO_STEP_MAX * 2) - precision * GEOHASH_BITS_PER_CHAR);
+    int found = 0;
+    for (int k = 0; k < *clusterCount; k++) {
+        if ((*clusters)[k].hash == truncated_hash) {
+            (*clusters)[k].count++;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        if (*clusterCount >= *clusterCapacity) {
+            *clusterCapacity = *clusterCapacity ? *clusterCapacity * 2 : 16;
+            *clusters = zrealloc(*clusters, sizeof(cluster) * *clusterCapacity);
+        }
+        (*clusters)[*clusterCount].hash = truncated_hash;
+        (*clusters)[*clusterCount].count = 1;
+        (*clusters)[*clusterCount].lon = xy[0];
+        (*clusters)[*clusterCount].lat = xy[1];
+        (*clusterCount)++;
+    }
+}
+
+/* GEOCLUSTER key PRECISION <1-12> [COUNT <max-clusters>]
+ *
+ * Clusters points in a geospatial index using geohash-based clustering.
+ * Returns an array of clusters, each containing the geohash and member count. */
+void geoclusterCommand(client *c) {
+    /* Look up the requested zset */
+    robj *zobj = lookupKeyRead(c->db, c->argv[1]);
+    if (checkType(c, zobj, OBJ_ZSET)) return;
+    /* Parse arguments */
+    int precision = 6;
+    long long maxcount = 0;
+    int i = 2;
+    if (i < c->argc && !strcasecmp(c->argv[i]->ptr, "precision")) {
+        i++;
+        if (i >= c->argc) {
+            addReplyError(c, "PRECISION requires a value");
+            return;
+        }
+        long long prec;
+        if (getLongLongFromObjectOrReply(c, c->argv[i], &prec, NULL) != C_OK) return;
+        if (prec < 1 || prec > 12) {
+            addReplyError(c, "PRECISION must be between 1 and 12");
+            return;
+        }
+        precision = (int)prec;
+        i++;
+    }
+    if (i < c->argc && !strcasecmp(c->argv[i]->ptr, "count")) {
+        i++;
+        if (i >= c->argc) {
+            addReplyError(c, "COUNT requires a value");
+            return;
+        }
+        if (getLongLongFromObjectOrReply(c, c->argv[i], &maxcount, NULL) != C_OK) return;
+        if (maxcount <= 0) {
+            addReplyError(c, "COUNT must be > 0");
+            return;
+        }
+        i++;
+    }
+    if (i < c->argc) {
+        addReplyErrorObject(c, shared.syntaxerr);
+        return;
+    }
+    if (!zobj) {
+        addReply(c, shared.emptyarray);
+        return;
+    }
+    /* Process members directly and build clusters */
+    cluster *clusters = NULL;
+    int clusterCount = 0;
+    int clusterCapacity = 0;
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr = lpSeek(zl, 0);
+        unsigned char *sptr;
+        while (eptr != NULL) {
+            sptr = lpNext(zl, eptr);
+            if (sptr == NULL) break;
+            double score = zzlGetScore(sptr);
+            double xy[2];
+            if (decodeGeohash(score, xy)) {
+                processPointForClustering(xy, precision, &clusters, &clusterCount, &clusterCapacity);
+            }
+            eptr = lpNext(zl, sptr);
+        }
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = zobj->ptr;
+        zskiplistNode *ln = zs->zsl->header->level[0].forward;
+        while (ln) {
+            double xy[2];
+            if (decodeGeohash(ln->score, xy)) {
+                processPointForClustering(xy, precision, &clusters, &clusterCount, &clusterCapacity);
+            }
+            ln = ln->level[0].forward;
+        }
+    }
+    /* Limit results if requested */
+    if (maxcount > 0 && clusterCount > maxcount) clusterCount = maxcount;
+    addReplyArrayLen(c, clusterCount);
+    char *geoalphabet = "0123456789bcdefghjkmnpqrstuvwxyz";
+    for (int i = 0; i < clusterCount; i++) {
+        addReplyArrayLen(c, 4);
+        /* Generate Base32 geohash from truncated hash */
+        char geohash[13];
+        uint64_t hash_bits = clusters[i].hash;
+        for (int idx = precision - 1; idx >= 0; idx--) {
+            geohash[idx] = geoalphabet[hash_bits & 0x1f];
+            hash_bits >>= GEOHASH_BITS_PER_CHAR;
+        }
+        geohash[precision] = '\0';
+        addReplyBulkCString(c, geohash);
+        addReplyLongLong(c, clusters[i].count);
+        addReplyHumanLongDouble(c, clusters[i].lon);
+        addReplyHumanLongDouble(c, clusters[i].lat);
+    }
+    if (clusters) zfree(clusters);
+}
