@@ -211,6 +211,33 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion, double *width,
     return C_OK;
 }
 
+/* Input Argument Helper.
+ * Extract polygon vertices from the specified arguments starting at 'argv'
+ * that should be in the form: <num_vertices> <lon1> <lat1> <lon2> <lat2> ..., and return C_OK or C_ERR means success or failure
+ * *num_vertices is populated with the number of vertices, *points is allocated and populated with vertex coordinates.*/
+int extractPolygonOrReply(client *c, robj **argv, int argc, int *num_vertices, double **points) {
+    int vertices;
+    if (getIntFromObjectOrReply(c, argv[0], &vertices, "invalid number of vertices") != C_OK) {
+        return C_ERR;
+    }
+    int possible_vertices = (argc - 1) / 2;
+    if (vertices < 3 || possible_vertices < vertices) {
+        addReplyError(c, "BYPOLYGON must have at least 3 vertices");
+        return C_ERR;
+    }
+    if (num_vertices) *num_vertices = vertices;
+    if (points) {
+        *points = zmalloc(vertices * 2 * sizeof(double));
+        for (int j = 0; j < vertices; j++) {
+            if (extractLongLatOrReply(c, argv + 1 + j * 2, *points + j * 2) == C_ERR) {
+                zfree(*points);
+                return C_ERR;
+            }
+        }
+    }
+    return C_OK;
+}
+
 /* The default addReplyDouble has too much accuracy.  We use this
  * for returning location distances. "5.2145 meters away" is nicer
  * than "5.2144992818115 meters away." We provide 4 digits after the dot
@@ -643,29 +670,19 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                 bybox = 1;
                 i += 3;
             } else if (!strcasecmp(arg, "bypolygon") && (i + 2) < remaining && flags & GEOSEARCH && !byradius && !bybox && !frommember && !fromloc) {
-                int num_vertices = 0;
-                if (getIntFromObjectOrReply(c, c->argv[base_args + i + 1], &num_vertices, "invalid number of vertices") != C_OK) {
+                int num_vertices;
+                double *points;
+                if (extractPolygonOrReply(c, c->argv + base_args + i + 1, remaining - i - 1, &num_vertices, &points) == C_ERR) {
+                    geoPolygonPointsFree(&shape);
                     return;
                 }
-                /* Check how many args are remaining. Divide by 2 to see the possible number of vertices. */
-                int possible_vertices = (remaining - i - 2) / 2;
-                if (num_vertices < 3 || possible_vertices < num_vertices) {
-                    addReplyError(c, "GEOSEARCH BYPOLYGON must have at least 3 vertices");
-                    return;
-                }
-                /* Extract polygon vertices. */
                 shape.conversion = 1;
                 shape.t.polygon.num_vertices = num_vertices;
-                shape.t.polygon.points = zmalloc(num_vertices * sizeof(double[2]));
-                for (int j = 0; j < num_vertices * 2; j += 2) {
-                    if (extractLongLatOrReply(c, c->argv + base_args + i + 2 + j, shape.t.polygon.points[j / 2]) == C_ERR) {
-                        zfree(shape.t.polygon.points);
-                        return;
-                    }
-                }
+                shape.t.polygon.points = (double (*)[2])points;
                 shape.type = POLYGON_TYPE;
+                int consumed = 1 + num_vertices * 2;
                 bypolygon = 1;
-                i += (1 + num_vertices * 2);
+                i += consumed;
             } else {
                 addReplyErrorObject(c, shared.syntaxerr);
                 geoPolygonPointsFree(&shape);
@@ -1074,7 +1091,7 @@ static void geoProcessPointForClustering(double *xy, int precision, dict *cluste
     }
 }
 
-/* GEOCLUSTER key PRECISION <1-11> [COUNT <max-clusters>]
+/* GEOCLUSTER key [PRECISION <1-11>] [COUNT <max-clusters>] [BYPOLYGON lon1 lat1 lon2 lat2 ...]
  *
  * Clusters points in a geospatial index using geohash-based clustering.
  * Returns an array of clusters, each containing the geohash and member count. */
@@ -1085,68 +1102,89 @@ void geoclusterCommand(client *c) {
     /* Parse arguments */
     int precision = 6;
     long long maxcount = 0;
-    int i = 2;
-    if (i < c->argc && !strcasecmp(c->argv[i]->ptr, "precision")) {
-        i++;
-        if (i >= c->argc) {
-            addReplyError(c, "PRECISION requires a value");
-            return;
+    GeoShape shape = {0};
+    int bypolygon = 0;
+    dict *clusterDict = NULL;
+    if (c->argc > 2) {
+        int remaining = c->argc - 2;
+        for (int i = 0; i < remaining; i++) {
+            char *arg = c->argv[2 + i]->ptr;
+            if (!strcasecmp(arg, "precision") && (i + 1) < remaining) {
+                long long prec;
+                if (getLongLongFromObjectOrReply(c, c->argv[2 + i + 1], &prec, NULL) != C_OK) goto cleanup;
+                if (prec < 1 || prec > 11) {
+                    addReplyError(c, "PRECISION must be between 1 and 11");
+                    goto cleanup;
+                }
+                precision = (int)prec;
+                i++;
+            } else if (!strcasecmp(arg, "count") && (i + 1) < remaining) {
+                if (getLongLongFromObjectOrReply(c, c->argv[2 + i + 1], &maxcount, NULL) != C_OK) goto cleanup;
+                if (maxcount <= 0) {
+                    addReplyError(c, "COUNT must be > 0");
+                    goto cleanup;
+                }
+                i++;
+            } else if (!strcasecmp(arg, "bypolygon") && (i + 2) < remaining && !bypolygon) {
+                int num_vertices;
+                double *points;
+                if (extractPolygonOrReply(c, c->argv + 2 + i + 1, remaining - i - 1, &num_vertices, &points) == C_ERR) goto cleanup;
+                shape.conversion = 1;
+                shape.t.polygon.num_vertices = num_vertices;
+                shape.t.polygon.points = (double (*)[2])points;
+                shape.type = POLYGON_TYPE;
+                bypolygon = 1;
+                int consumed = 1 + num_vertices * 2;
+                i += consumed;
+            } else {
+                addReplyErrorObject(c, shared.syntaxerr);
+                goto cleanup;
+            }
         }
-        long long prec;
-        if (getLongLongFromObjectOrReply(c, c->argv[i], &prec, NULL) != C_OK) return;
-        if (prec < 1 || prec > 11) {
-            addReplyError(c, "PRECISION must be between 1 and 11");
-            return;
-        }
-        precision = (int)prec;
-        i++;
-    }
-    if (i < c->argc && !strcasecmp(c->argv[i]->ptr, "count")) {
-        i++;
-        if (i >= c->argc) {
-            addReplyError(c, "COUNT requires a value");
-            return;
-        }
-        if (getLongLongFromObjectOrReply(c, c->argv[i], &maxcount, NULL) != C_OK) return;
-        if (maxcount <= 0) {
-            addReplyError(c, "COUNT must be > 0");
-            return;
-        }
-        i++;
-    }
-    if (i < c->argc) {
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
     }
     if (!zobj) {
         addReply(c, shared.emptyarray);
-        return;
+        goto cleanup;
     }
-    /* Process members directly and build clusters */
-    dict *clusterDict = dictCreate(&uint64ClusterDictType);
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
-        unsigned char *zl = zobj->ptr;
-        unsigned char *eptr = lpSeek(zl, 0);
-        unsigned char *sptr;
-        while (eptr != NULL) {
-            sptr = lpNext(zl, eptr);
-            if (sptr == NULL) break;
-            double score = zzlGetScore(sptr);
-            double xy[2];
-            if (decodeGeohash(score, xy)) {
-                geoProcessPointForClustering(xy, precision, clusterDict);
-            }
-            eptr = lpNext(zl, sptr);
+    /* Process members using spatial indexing if polygon specified */
+    clusterDict = dictCreate(&uint64ClusterDictType);
+    if (bypolygon) {
+        /* Use spatial indexing to avoid scanning all members */
+        GeoHashRadius georadius = geohashCalculateAreasByShapeWGS84(&shape);
+        geoArray ga;
+        geoArrayInit(&ga);
+        membersOfAllNeighbors(zobj, &georadius, &shape, &ga, 0);
+        for (size_t j = 0; j < ga.used; j++) {
+            double xy[2] = {ga.array[j].longitude, ga.array[j].latitude};
+            geoProcessPointForClustering(xy, precision, clusterDict);
         }
-    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
-        zset *zs = zobj->ptr;
-        zskiplistNode *ln = zs->zsl->header->level[0].forward;
-        while (ln) {
-            double xy[2];
-            if (decodeGeohash(ln->score, xy)) {
-                geoProcessPointForClustering(xy, precision, clusterDict);
+        geoArrayCleanup(&ga);
+    } else {
+        /* Scan all members */
+        if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+            unsigned char *zl = zobj->ptr;
+            unsigned char *eptr = lpSeek(zl, 0);
+            unsigned char *sptr;
+            while (eptr != NULL) {
+                sptr = lpNext(zl, eptr);
+                if (sptr == NULL) break;
+                double score = zzlGetScore(sptr);
+                double xy[2];
+                if (decodeGeohash(score, xy)) {
+                    geoProcessPointForClustering(xy, precision, clusterDict);
+                }
+                eptr = lpNext(zl, sptr);
             }
-            ln = ln->level[0].forward;
+        } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+            zset *zs = zobj->ptr;
+            zskiplistNode *ln = zs->zsl->header->level[0].forward;
+            while (ln) {
+                double xy[2];
+                if (decodeGeohash(ln->score, xy)) {
+                    geoProcessPointForClustering(xy, precision, clusterDict);
+                }
+                ln = ln->level[0].forward;
+            }
         }
     }
     /* Get clusters and sort if COUNT specified */
@@ -1179,6 +1217,7 @@ void geoclusterCommand(client *c) {
         }
         dictReleaseIterator(di);
     }
-    /* Cleanup hash table */
-    dictRelease(clusterDict);
+cleanup:
+    geoPolygonPointsFree(&shape);
+    if (clusterDict) dictRelease(clusterDict);
 }
