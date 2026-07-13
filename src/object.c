@@ -583,10 +583,56 @@ robj *createModuleObject(moduleType *mt, void *value) {
     return createObject(OBJ_MODULE, mv);
 }
 
+/* PinBack: metadata stored after the robj shell in a RAW_BORROWED allocation.
+ * Layout: [robj shell (32B) | PinBack].
+ * Used to re-adopt or free the pinned sds on reply completion.
+ *
+ * The field is stored as an OWNED sdsdup copy: a concurrent HDEL/HSET-overwrite
+ * can free or realloc the specific entry (freeing its embedded field) even while
+ * the hash object is pinned, so hashTypeUnpinStringRef must look the field up
+ * from a buffer it owns, not a pointer into the (possibly-freed) entry. */
+typedef struct PinBack {
+    robj *hash_obj;     /* The hash key object (refcount-pinned) */
+    sds field;          /* OWNED sdsdup copy of the field name (freed at unpin) */
+    void *sr;           /* stringRef* allocated during pin */
+    sds p;              /* The sds value buffer we own */
+} PinBack;
+
 void freeStringObject(robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
         sdsfree(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_RAW_BORROWED) {
+        /* StringRef-pin shell: read PinBack, unpin the field value. */
+        PinBack *pb = (PinBack *)((char *)o + sizeof(robj));
+        hashTypeUnpinStringRef(pb->hash_obj, pb->field, pb->sr, pb->p);
+        sdsfree(pb->field);      /* owned copy */
+        decrRefCount(pb->hash_obj);
     }
+}
+
+/* Create a RAW_BORROWED shell for a stringRef-pinned hash field value.
+ * The shell's sds pointer aliases 'p' (the pinned value buffer).
+ * The hash_obj is incrRefCount'd so it can't be freed while in-flight.
+ * On freeStringObject, the PinBack triggers re-adoption or sdsfree.
+ *
+ * Allocation layout: [robj | PinBack]. */
+robj *createBorrowedShellForStringRefPin(robj *hash_obj, sds field, void *sr, sds p) {
+    robj *shell = zmalloc(sizeof(robj) + sizeof(PinBack));
+    shell->type = OBJ_STRING;
+    shell->encoding = OBJ_ENCODING_RAW_BORROWED;
+    shell->lru = 0;
+    shell->hasexpire = 0;
+    shell->hasembkey = 0;
+    shell->hasembval = 0;
+    shell->refcount = 1;
+    objectSetVal(shell, p);
+    incrRefCount(hash_obj);
+    PinBack *pb = (PinBack *)((char *)shell + sizeof(robj));
+    pb->hash_obj = hash_obj;
+    pb->field = sdsdup(field);  /* OWNED copy — entry may be freed by a concurrent write */
+    pb->sr = sr;
+    pb->p = p;
+    return shell;
 }
 
 void freeListObject(robj *o) {

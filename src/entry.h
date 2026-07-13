@@ -9,6 +9,9 @@
 #include "util.h"
 #include <stdbool.h>
 
+/* Forward declaration */
+struct stringRef;
+
 /*-----------------------------------------------------------------------------
  * Entry
  *----------------------------------------------------------------------------*/
@@ -54,6 +57,26 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry);
  * The reference points to the provided `buf` but does not assume ownership.
  * An external mechanism must handle the eventual memory deallocation of `buf`. */
 entry *entryUpdateAsStringRef(entry *entry, const char *buf, size_t len, mstime_t expiry);
+
+/* Detach a Type-3 entry's owned sds value and convert it to a stringRef
+ * pointing at the same memory. Ownership of the sds transfers to the caller.
+ * Returns the detached sds, or NULL if not applicable. */
+sds entryDetachValueAsStringRef(entry *e, struct stringRef **out_sr);
+
+/* Re-adopt a previously detached sds back into the entry (Type-4 -> Type-3). */
+void entryReadoptStringRefValue(entry *e, sds p, struct stringRef *sr);
+
+/* Borrow-refcount helpers for shareable pinned stringRefs (hash zero-copy pin).
+ * entryStringRefBorrow increments the in-flight borrow count; entryStringRefRelease
+ * decrements it and returns the remaining count (0 == last borrower). */
+void entryStringRefBorrow(struct stringRef *sr);
+uint32_t entryStringRefRelease(struct stringRef *sr);
+
+/* Returns the entry's stringRef container, or NULL if not a stringRef. */
+struct stringRef *entryGetValueStringRef(const entry *e);
+
+/* Returns true if the entry's value is our reply-pin container (has a refcount). */
+bool entryValueIsPin(const entry *e);
 
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.

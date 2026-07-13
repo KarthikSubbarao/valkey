@@ -57,6 +57,7 @@
  * -------------------------------------------------------------------------- */
 #include "server.h"
 #include "cluster.h"
+#include "entry.h"
 #include "commandlog.h"
 #include "rdb.h"
 #include "monotonic.h"
@@ -12034,9 +12035,16 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
         value = createStringObjectFromLongDouble(node->score, 0);
     } else if (objectGetType(o) == OBJ_HASH) {
         key = entryGetField(entry);
-        size_t val_len;
-        char *val = entryGetValue(entry, &val_len);
-        value = createStringObject(val, val_len);
+        /* Zero-copy: pin the field value via stringRef detach.
+         * The shell holds a BULK_STR_REF reference; on reply completion,
+         * freeStringObject re-adopts the sds or frees it if entry is gone. */
+        value = hashTypePinValueForReply(o, entryGetField(entry));
+        if (!value) {
+            /* Fallback: embedded value or pin failed — copy */
+            size_t val_len;
+            char *val = entryGetValue(entry, &val_len);
+            value = createStringObject(val, val_len);
+        }
     } else {
         serverPanic("unexpected object type");
     }
@@ -12045,6 +12053,86 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
     data->fn(data->key, field, value, data->user_data);
     decrRefCount(field);
     if (value) decrRefCount(value);
+}
+
+/* ScanKeyRawPinned: like ScanKey but for hashes only.
+ * Field delivered as raw (const char*, len) -- no name robj.
+ * Value delivered as a pinned ValkeyModuleString shell (OBJ_ENCODING_RAW_BORROWED)
+ * that the module can reply with directly (BULK_STR_REF zero-copy).
+ * If pinning fails (embedded/listpack value), falls back to createStringObject copy. */
+typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
+                                               const char *field, size_t field_len,
+                                               ValkeyModuleString *value_shell,
+                                               void *privdata);
+typedef struct {
+    ValkeyModuleKey *key;
+    void *user_data;
+    ValkeyModuleScanKeyRawPinnedCB fn;
+} ScanKeyRawPinnedCBData;
+
+static void moduleScanKeyRawPinnedHashtableCallback(void *privdata, void *entry) {
+    ScanKeyRawPinnedCBData *data = privdata;
+    robj *o = data->key->value;
+    sds field = entryGetField(entry);
+    size_t field_len = sdslen(field);
+
+    /* Pin the value: detach sds, entry becomes stringRef, shell owns the sds */
+    robj *value_shell = hashTypePinValueForReply(o, field);
+    if (!value_shell) {
+        /* Fallback: embedded value or listpack — copy */
+        size_t val_len;
+        char *val = entryGetValue(entry, &val_len);
+        value_shell = createStringObject(val, val_len);
+    }
+
+    data->fn(data->key, field, field_len, value_shell, data->user_data);
+    decrRefCount(value_shell);
+}
+
+/* VM_ScanKeyRawPinned -- scan a hash key, delivering field as raw bytes and
+ * value as a pinned (zero-copy safe) ValkeyModuleString shell.
+ * Hash-only. Returns 1 if more elements to scan, 0 when done. */
+int VM_ScanKeyRawPinned(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
+                        ValkeyModuleScanKeyRawPinnedCB fn, void *privdata) {
+    if (key == NULL || key->value == NULL) {
+        errno = EINVAL;
+        return 0;
+    }
+    robj *o = key->value;
+    if (objectGetType(o) != OBJ_HASH) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        /* Listpack: iterate entries, deliver as raw bytes + copy (cheap, small) */
+        if (cursor->done) { errno = ENOENT; return 0; }
+        unsigned char *lp = objectGetVal(o);
+        unsigned char *p = lpFirst(lp);
+        while (p) {
+            unsigned int flen;
+            char *fptr = (char *)lpGetValue(p, &flen, NULL);
+            p = lpNext(lp, p);
+            if (!p) break;
+            unsigned int vlen;
+            char *vptr = (char *)lpGetValue(p, &vlen, NULL);
+            robj *val_obj = createStringObject(vptr ? vptr : "", vptr ? vlen : 0);
+            fn(key, fptr, flen, val_obj, privdata);
+            decrRefCount(val_obj);
+            p = lpNext(lp, p);
+        }
+        cursor->done = 1;
+        return 0;
+    }
+    /* Hashtable encoding */
+    if (cursor->done) { errno = ENOENT; return 0; }
+    hashtable *ht = objectGetVal(o);
+    ScanKeyRawPinnedCBData data = {key, privdata, fn};
+    cursor->cursor = hashtableScan(ht, cursor->cursor, moduleScanKeyRawPinnedHashtableCallback, &data);
+    if (cursor->cursor == 0) {
+        cursor->done = 1;
+        return 0;
+    }
+    return 1;
 }
 
 /* Scan api that allows a module to scan the elements in a hash, set or sorted set key
@@ -15440,6 +15528,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(ScanCursorRestart);
     REGISTER_API(Scan);
     REGISTER_API(ScanKey);
+    REGISTER_API(ScanKeyRawPinned);
     REGISTER_API(CreateModuleUser);
     REGISTER_API(SetContextUser);
     REGISTER_API(SetModuleUserACL);
