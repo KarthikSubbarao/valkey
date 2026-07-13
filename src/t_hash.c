@@ -368,75 +368,35 @@ robj *hashTypePinValueForReply(robj *o, sds field) {
 
     entry *e = *entry_ref;
 
-    /* Can't pin embedded values (they live inside the entry allocation) */
+    /* Embedded (small) values: copy. Safe — read synchronously from the live
+     * entry during the scan; no zero-copy borrow needed for tiny values. */
     if (entryHasEmbeddedValue(e)) return NULL;
+    /* Module-externalized stringRef: buffer is module-owned; copy. */
+    if (entryHasStringRef(e)) return NULL;
 
-    /* Already a stringRef: if it is OUR reply-pin container (VALUE_IS_PIN set),
-     * share it via the borrow refcount instead of copying — this is what lets
-     * concurrent replies of the same field all be zero-copy. If it is some other
-     * stringRef (e.g. module-externalized via VM_HashSetStringRef — a plain 16B
-     * struct with NO refcount field), we must NOT touch refs (offset-16 overflow);
-     * fall back to copy (return NULL). */
-    if (entryHasStringRef(e)) {
-        if (!entryValueIsPin(e))
-            return NULL;   /* not our pin container -> caller copies */
-        stringRef *sr = entryGetValueStringRef(e);
-        if (!sr) return NULL;
-        entryStringRefBorrow(sr);
-        return createBorrowedShellForStringRefPin(o, field, sr, (sds)sr->buf);
-    }
-
-    /* First borrower: detach the sds value, converting entry to a shareable
-     * stringRef in-place. detach initializes refs=1 for THE ENTRY's reference;
-     * add one for this reply shell (entryStringRefBorrow), so refs=2 = entry+shell. */
-    stringRef *sr = NULL;
-    sds detached = entryDetachValueAsStringRef(e, &sr);
-    if (!detached) return NULL;
-    entryStringRefBorrow(sr);   /* this reply shell's reference */
-
-    /* Create a borrowed shell carrying the pin metadata */
-    return createBorrowedShellForStringRefPin(o, field, sr, detached);
+    /* B3: Type-3 owned sds. Do NOT mutate the entry. Mark the value buffer as
+     * borrowed in the side table and hand back a RAW_BORROWED shell aliasing the
+     * LIVE buffer. A concurrent free of this field will consult the table and
+     * defer (entryFreeValuePtr -> hashValueBorrowRequestFree). The reply's
+     * completion (hashTypeUnpinStringRef) decrements and frees if it was the
+     * last holder of a freed value. The shell also refcount-pins the hash object
+     * so DEL/FLUSH of the whole key can't free it mid-reply. */
+    size_t vlen;
+    char *p = entryGetValue(e, &vlen);
+    if (!p) return NULL;
+    hashValueBorrowIncr(p);
+    return createBorrowedShellForStringRefPin(o, field, NULL, (sds)p);
 }
 
-/* Unpin a stringRef-pinned value when an in-flight reply shell is freed
- * (from freeStringObject after the io-thread write completes).
- *
- * refs counts all holders (the entry + every reply shell). Dropping this shell:
- *  - refs -> 0 : we were the last holder (the entry already dropped its ref via
- *                entryFreeValuePtr on HDEL/DEL/FLUSH/expiry/overwrite). Free buf+container.
- *  - refs -> 1 AND the entry still holds THIS container : the entry is the sole
- *                remaining holder -> re-adopt (entry reclaims buf as Type-3,
- *                frees the container) to restore 0-at-rest.
- *  - otherwise : other holders remain (entry + more shells, or other shells) -> do nothing.
- * The entry's own counted reference guarantees the container is alive here. */
+/* Reply-done for a B3-borrowed value (from freeStringObject when the shell is
+ * freed after the io-thread write completes). Decrement the borrow count; if the
+ * owning entry was freed/overwritten while borrowed (wantfree) and this was the
+ * last reader, free the buffer now. Never mutates the entry. */
 void hashTypeUnpinStringRef(robj *o, sds field, void *sr_ptr, sds p) {
-    stringRef *sr = (stringRef *)sr_ptr;
-    uint32_t remaining = entryStringRefRelease(sr);
-
-    if (remaining == 0) {
-        /* Last holder overall: the entry already relinquished. We free. */
-        sdsfree(p);
-        zfree(sr);
-        return;
-    }
-
-    /* Holders remain. Re-adopt only if the entry is the SOLE remaining holder
-     * (remaining == 1) AND it still points at this exact container. */
-    if (remaining != 1) return;
-    if (o == NULL || objectGetType(o) != OBJ_HASH ||
-        objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-        return; /* the remaining 1 is not an entry we can re-adopt into */
-    }
-    hashtable *ht = objectGetVal(o);
-    void **entry_ref = hashtableFindRef(ht, field);
-    if (!entry_ref) return;
-    entry *e = *entry_ref;
-    if (!entryValueIsPin(e)) return;                 /* entry no longer our pin */
-    if (entryGetValueStringRef(e) != sr) return;     /* different container */
-
-    /* Entry is the sole holder: reclaim buf, free the container (consumes the
-     * entry's reference). Restores Type-3 owned sds -> 0-at-rest. */
-    entryReadoptStringRefValue(e, p, sr);
+    (void)o;
+    (void)field;
+    (void)sr_ptr;
+    if (hashValueBorrowDecr(p)) sdsfree(p);
 }
 
 /* Add a new field, overwrite the old with the new value if it already exists.

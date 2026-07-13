@@ -183,37 +183,77 @@ char *entryGetValue(const entry *entry, size_t *len) {
     return *value_ref;
 }
 
+/* ---- B3 hash-value borrow side table (main-thread only; empty at rest) ------
+ * Tracks the value sds buffers that in-flight zero-copy FT.SEARCH replies are
+ * currently reading. A concurrent free (HSET overwrite / HDEL / DEL / FLUSH /
+ * field expiry) consults this table: if the buffer is being read, the free is
+ * DEFERRED to the reply's completion instead of freed under the io-thread write.
+ * The hash entry itself is never mutated (stays Type-3). The table is empty when
+ * no reply is in flight, so there is zero memory overhead at rest. */
+typedef struct hashBorrow {
+    const void *buf;    /* value sds buffer being borrowed (the lookup key) */
+    uint32_t count;     /* number of in-flight replies reading it */
+    uint8_t wantfree;   /* the owning entry has since been freed/overwritten */
+} hashBorrow;
+static const void *hashBorrowGetKey(const void *entry) { return ((const hashBorrow *)entry)->buf; }
+static hashtableType hashBorrowType = {.entryGetKey = hashBorrowGetKey};
+static hashtable *g_hashBorrow = NULL;
+
+/* Reply-append: one more in-flight reply is reading buf. */
+void hashValueBorrowIncr(const void *buf) {
+    if (!g_hashBorrow) g_hashBorrow = hashtableCreate(&hashBorrowType);
+    void *found;
+    if (hashtableFind(g_hashBorrow, buf, &found)) {
+        ((hashBorrow *)found)->count++;
+    } else {
+        hashBorrow *b = zmalloc(sizeof(*b));
+        b->buf = buf;
+        b->count = 1;
+        b->wantfree = 0;
+        hashtableAdd(g_hashBorrow, b);
+    }
+}
+
+/* Reply-done: one fewer in-flight reply. Returns 1 if the caller must now
+ * sdsfree(buf) (count reached 0 AND the owning entry already requested free). */
+int hashValueBorrowDecr(const void *buf) {
+    if (!g_hashBorrow) return 0;
+    void *found;
+    if (!hashtableFind(g_hashBorrow, buf, &found)) return 0;
+    hashBorrow *b = found;
+    if (--b->count > 0) return 0;
+    int must_free = b->wantfree;
+    hashtableDelete(g_hashBorrow, buf);
+    zfree(b);
+    return must_free;
+}
+
+/* Entry free path: if buf is currently borrowed, mark it free-wanted and return
+ * 1 (caller must NOT free now — the last reply-done frees it). Returns 0 if not
+ * borrowed (caller frees now, as usual). */
+int hashValueBorrowRequestFree(const void *buf) {
+    if (!g_hashBorrow) return 0;
+    void *found;
+    if (!hashtableFind(g_hashBorrow, buf, &found)) return 0;
+    ((hashBorrow *)found)->wantfree = 1;
+    return 1;
+}
+
 /* Frees the entry's non-embedded value.
  * If the value is a string reference (stringRef), only the entry's pointer
  * is freed, as the underlying string is not owned by this entry.
- * Otherwise, the value is a standard SDS and is fully freed. */
+ * Otherwise, the value is a standard SDS. B3: if an in-flight zero-copy reply is
+ * borrowing that buffer, defer the free (the reply's completion frees it). */
 static void entryFreeValuePtr(entry *entry) {
     serverAssert(entryHasValuePtr(entry));
     void **value_ref = entryGetValueRef(entry);
     if (entryHasStringRef(entry)) {
-        if (sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN)) {
-            /* Reply-pin container. refs counts all holders (this entry + every
-             * in-flight reply shell). The entry is going away (HDEL/DEL/FLUSH/
-             * expiry) or being overwritten (HSET), so DROP the entry's reference.
-             * Because the entry held a counted reference, the container is
-             * guaranteed alive here (no UAF). If we were the last holder
-             * (refs hits 0), free buf + container now; otherwise in-flight
-             * replies still hold it and the last one frees it at its unpin.
-             * This is the same discipline as robj refcount + decrRefCount. */
-            pinnedStringRef *pr = (pinnedStringRef *)*value_ref;
-            if (entryStringRefRelease(&pr->sr) == 0) {
-                sdsfree((sds)pr->sr.buf);
-                zfree(pr);
-            }
-            /* Clear the pin marker so a stale bit never lingers on a reused slot. */
-            sdsSetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN, 0);
-        } else {
-            /* Module-externalized stringRef: buffer is module-owned; free only
-             * the (non-refcounted) stringRef struct, exactly as before. */
-            zfree(*value_ref);
-        }
+        /* Module-externalized stringRef: buffer is module-owned; free only the
+         * (non-owned) stringRef struct. */
+        zfree(*value_ref);
     } else {
-        sdsfree(*value_ref);
+        /* Type-3 owned sds. Defer if a reply is reading it, else free now. */
+        if (!hashValueBorrowRequestFree(*value_ref)) sdsfree(*value_ref);
     }
     *value_ref = NULL;
 }

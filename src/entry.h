@@ -78,6 +78,13 @@ struct stringRef *entryGetValueStringRef(const entry *e);
 /* Returns true if the entry's value is our reply-pin container (has a refcount). */
 bool entryValueIsPin(const entry *e);
 
+/* B3 hash-value borrow side table (zero-copy reply safety; main-thread only).
+ * incr on reply-append, decr on reply-done (returns 1 if caller must sdsfree buf),
+ * requestFree on entry free (returns 1 if borrowed -> caller must NOT free now). */
+void hashValueBorrowIncr(const void *buf);
+int hashValueBorrowDecr(const void *buf);
+int hashValueBorrowRequestFree(const void *buf);
+
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.
  * In case expiry is EXPIRE_NONE, will use the existing entry expiration time. */
