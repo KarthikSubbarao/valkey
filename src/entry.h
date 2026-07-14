@@ -64,6 +64,8 @@ entry *entryUpdateAsStringRef(entry *entry, const char *buf, size_t len, mstime_
 void hashValueBorrowIncr(const void *buf);
 int hashValueBorrowDecr(const void *buf);
 int hashValueBorrowRequestFree(const void *buf);
+/* Read-only borrow check for active defrag (skip relocating borrowed buffers). */
+int hashValueIsBorrowed(const void *buf);
 
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.

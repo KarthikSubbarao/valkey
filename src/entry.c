@@ -223,6 +223,15 @@ int hashValueBorrowRequestFree(const void *buf) {
     return 1;
 }
 
+/* Read-only: is this value buffer currently borrowed by an in-flight reply?
+ * Used by active defrag to SKIP relocating a borrowed buffer (a move would
+ * dangle the borrow-table key and the reply shell's pointer -> UAF). */
+int hashValueIsBorrowed(const void *buf) {
+    if (!g_hashBorrow) return 0;
+    void *found;
+    return hashtableFind(g_hashBorrow, buf, &found) ? 1 : 0;
+}
+
 /* Frees the entry's non-embedded value.
  * If the value is a string reference (stringRef), only the entry's pointer
  * is freed, as the underlying string is not owned by this entry.
@@ -585,8 +594,15 @@ entry *entryDefrag(entry *e, void *(*defragfn)(void *), sds (*sdsdefragfn)(sds))
         if (new_value) *value_ref = new_value;
     } else if (entryHasValuePtr(e)) {
         sds *value_ref = (sds *)entryGetValueRef(e);
-        sds new_value = sdsdefragfn(*value_ref);
-        if (new_value) *value_ref = new_value;
+        /* B3: never MOVE a value buffer that an in-flight reply is borrowing —
+         * the borrow table + reply shell reference it by address, and B3 only
+         * defers frees, not moves. Skip relocating it this cycle; a later defrag
+         * pass will move it once the borrow clears. Moving the entry allocation
+         * below is still fine (the value buffer is a separate allocation). */
+        if (!hashValueIsBorrowed(*value_ref)) {
+            sds new_value = sdsdefragfn(*value_ref);
+            if (new_value) *value_ref = new_value;
+        }
     }
     char *allocation = entryGetAllocPtr(e);
     char *new_allocation = defragfn(allocation);
