@@ -96,25 +96,9 @@ enum {
      * entry destruction. The primary usecase is to avoid memory duplication
      * between the core and a module. */
     FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF = 2,
-    /* SDS aux flag. If set, the entry's stringRef value is a reply-pin container
-     * (pinnedStringRef, allocated by entryDetachValueAsStringRef) that carries a
-     * borrow refcount. Distinguishes our engine-owned zero-copy-reply pins from
-     * module-externalized stringRefs (VM_HashSetStringRef), whose buffer is
-     * module-owned and which have no refcount field. entryFreeValuePtr uses this
-     * to decide whether it may inspect refs / must relinquish to in-flight replies. */
-    FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN = 3,
     FIELD_SDS_AUX_BIT_MAX
 };
 static_assert(FIELD_SDS_AUX_BIT_MAX < sizeof(char) - SDS_TYPE_BITS, "too many sds bits are used for entry metadata");
-
-/* A borrow-refcounted stringRef container for the hash zero-copy-reply pin.
- * 'sr' MUST be first so a stringRef* casts back to this and zfree(&pr->sr) frees
- * the whole container. Only allocated by entryDetachValueAsStringRef, and only
- * referenced through a stringRef that has FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN set. */
-typedef struct pinnedStringRef {
-    stringRef sr;      /* MUST be first member */
-    uint32_t refs;     /* in-flight borrow count */
-} pinnedStringRef;
 
 /* The entry pointer is the field sds, but that's an implementation detail. */
 sds entryGetField(const entry *entry) {
@@ -472,86 +456,6 @@ entry *entryUpdateAsStringRef(entry *e, const char *buf, size_t len, mstime_t ex
 
     sdsSetAuxBit(entryGetField(new_entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
     return new_entry;
-}
-
-/* Detach a Type-3 entry's value sds and convert it to a Type-4 stringRef
- * pointing at the SAME memory. Does NOT free the sds — ownership transfers
- * to the caller. Returns the detached sds, or NULL if not applicable.
- * On success, *out_sr is set to the newly-allocated stringRef struct.
- *
- * Requirements: entry must be Type-3 (non-embedded, non-stringRef, has value ptr).
- * Does NOT handle expiry toggling (entry keeps its current expiry). */
-sds entryDetachValueAsStringRef(entry *e, stringRef **out_sr) {
-    if (!entryHasValuePtr(e)) return NULL;
-    if (entryHasStringRef(e)) return NULL;
-
-    sds *value_ref = entryGetSdsValueRef(e);
-    sds detached = *value_ref;
-    if (!detached) return NULL;
-
-    /* Create a shareable stringRef container pointing at the same buffer.
-     * refs is the TOTAL holder count. Initialize to 1 for THE ENTRY's own
-     * reference. Each in-flight reply shell adds another (entryStringRefBorrow),
-     * including the very first pin's shell — the caller increments per shell.
-     * The container+buffer are freed only when refs hits 0 (last holder gone). */
-    pinnedStringRef *pr = zmalloc(sizeof(pinnedStringRef));
-    pr->sr.buf = detached;
-    pr->sr.len = sdslen(detached);
-    pr->refs = 1;   /* the entry's reference */
-
-    /* Replace value slot with stringRef, set aux bits (stringRef + pin marker) */
-    *value_ref = (sds)&pr->sr;
-    sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
-    sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN, 1);
-
-    *out_sr = &pr->sr;
-    return detached;
-}
-
-/* Public accessor: return the entry's stringRef container, or NULL if the entry
- * is not currently a stringRef. */
-stringRef *entryGetValueStringRef(const entry *e) {
-    if (!entryHasStringRef(e)) return NULL;
-    return (stringRef *)*entryGetValueRef(e);
-}
-
-/* Returns true if the entry's stringRef value is OUR reply-pin container
- * (pinnedStringRef with a refcount), false for a plain/module stringRef or
- * non-stringRef. Callers must check this before touching pinnedStringRef.refs. */
-bool entryValueIsPin(const entry *e) {
-    return entryHasStringRef(e) &&
-           sdsGetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN);
-}
-
-/* Increment the borrow count of an already-pinned (shareable) stringRef.
- * Called when a concurrent reply borrows a value already detached by a
- * prior in-flight reply — avoids the copy fallback. Main-thread only. */
-void entryStringRefBorrow(stringRef *sr) {
-    pinnedStringRef *pr = (pinnedStringRef *)sr;
-    pr->refs++;
-}
-
-/* Decrement the borrow count; returns the remaining count. When it returns 0,
- * the caller (hashTypeUnpinStringRef) owns re-adoption/freeing. Main-thread only. */
-uint32_t entryStringRefRelease(stringRef *sr) {
-    pinnedStringRef *pr = (pinnedStringRef *)sr;
-    return --pr->refs;
-}
-
-/* Re-adopt a previously detached sds value back into the entry.
- * The entry must currently be a stringRef (Type-4) with sr->buf == p.
- * Converts it back to Type-3 (owned sds). Frees the stringRef struct. */
-void entryReadoptStringRefValue(entry *e, sds p, stringRef *sr) {
-    serverAssert(entryHasStringRef(e));
-    sds *value_ref = entryGetSdsValueRef(e);
-    serverAssert(*value_ref == (sds)sr);
-    serverAssert(sr->buf == p);
-
-    /* Replace stringRef with the sds, clear aux bits (stringRef + pin marker) */
-    *value_ref = p;
-    sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 0);
-    sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_VALUE_IS_PIN, 0);
-    zfree(sr);
 }
 
 /* Modify the entry's value and/or expiration time.
