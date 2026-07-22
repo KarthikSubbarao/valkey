@@ -12048,24 +12048,24 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
     if (value) decrRefCount(value);
 }
 
-/* ScanKeyRawPinned: like ScanKey but for hashes only.
+/* ScanKeyRawBorrowed: like ScanKey but for hashes only.
  * Field delivered as raw (const char*, len) -- no name robj.
  * Value delivered as a raw borrowed (const char*, len) pair -- no robj, no copy.
  * The value pointer aliases the live buffer and is valid only for the duration of
  * the callback/command; the module must copy it out (e.g. ReplyWithStringBuffer)
  * before returning to the event loop. */
-typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
+typedef void (*ValkeyModuleScanKeyRawBorrowedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
                                                const char *value, size_t value_len,
                                                void *privdata);
 typedef struct {
     ValkeyModuleKey *key;
     void *user_data;
-    ValkeyModuleScanKeyRawPinnedCB fn;
-} ScanKeyRawPinnedCBData;
+    ValkeyModuleScanKeyRawBorrowedCB fn;
+} ScanKeyRawBorrowedCBData;
 
-static void moduleScanKeyRawPinnedHashtableCallback(void *privdata, void *entry) {
-    ScanKeyRawPinnedCBData *data = privdata;
+static void moduleScanKeyRawBorrowedHashtableCallback(void *privdata, void *entry) {
+    ScanKeyRawBorrowedCBData *data = privdata;
     sds field = entryGetField(entry);
     size_t field_len = sdslen(field);
 
@@ -12078,11 +12078,11 @@ static void moduleScanKeyRawPinnedHashtableCallback(void *privdata, void *entry)
     data->fn(data->key, field, field_len, val, val_len, data->user_data);
 }
 
-/* VM_ScanKeyRawPinned -- scan a hash key, delivering field as raw bytes and
+/* VM_ScanKeyRawBorrowed -- scan a hash key, delivering field as raw bytes and
  * value as a pinned (zero-copy safe) ValkeyModuleString shell.
  * Hash-only. Returns 1 if more elements to scan, 0 when done. */
-int VM_ScanKeyRawPinned(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
-                        ValkeyModuleScanKeyRawPinnedCB fn, void *privdata) {
+int VM_ScanKeyRawBorrowed(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
+                        ValkeyModuleScanKeyRawBorrowedCB fn, void *privdata) {
     if (key == NULL || key->value == NULL) {
         errno = EINVAL;
         return 0;
@@ -12133,8 +12133,8 @@ int VM_ScanKeyRawPinned(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
     /* Hashtable encoding */
     if (cursor->done) { errno = ENOENT; return 0; }
     hashtable *ht = objectGetVal(o);
-    ScanKeyRawPinnedCBData data = {key, privdata, fn};
-    cursor->cursor = hashtableScan(ht, cursor->cursor, moduleScanKeyRawPinnedHashtableCallback, &data);
+    ScanKeyRawBorrowedCBData data = {key, privdata, fn};
+    cursor->cursor = hashtableScan(ht, cursor->cursor, moduleScanKeyRawBorrowedHashtableCallback, &data);
     if (cursor->cursor == 0) {
         cursor->done = 1;
         return 0;
@@ -15535,7 +15535,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(ScanCursorRestart);
     REGISTER_API(Scan);
     REGISTER_API(ScanKey);
-    REGISTER_API(ScanKeyRawPinned);
+    REGISTER_API(ScanKeyRawBorrowed);
     REGISTER_API(CreateModuleUser);
     REGISTER_API(SetContextUser);
     REGISTER_API(SetModuleUserACL);

@@ -1495,7 +1495,7 @@ typedef void (*ValkeyModuleScanKeyCB)(ValkeyModuleKey *key,
                                       ValkeyModuleString *field,
                                       ValkeyModuleString *value,
                                       void *privdata);
-typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
+typedef void (*ValkeyModuleScanKeyRawBorrowedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
                                                const char *value, size_t value_len,
                                                void *privdata);
@@ -2036,9 +2036,9 @@ VALKEYMODULE_API int (*ValkeyModule_ScanKey)(ValkeyModuleKey *key,
                                              ValkeyModuleScanCursor *cursor,
                                              ValkeyModuleScanKeyCB fn,
                                              void *privdata) VALKEYMODULE_ATTR;
-VALKEYMODULE_API int (*ValkeyModule_ScanKeyRawPinned)(ValkeyModuleKey *key,
+VALKEYMODULE_API int (*ValkeyModule_ScanKeyRawBorrowed)(ValkeyModuleKey *key,
                                                       ValkeyModuleScanCursor *cursor,
-                                                      ValkeyModuleScanKeyRawPinnedCB fn,
+                                                      ValkeyModuleScanKeyRawBorrowedCB fn,
                                                       void *privdata) VALKEYMODULE_ATTR;
 VALKEYMODULE_API int (*ValkeyModule_GetContextFlagsAll)(void) VALKEYMODULE_ATTR;
 VALKEYMODULE_API int (*ValkeyModule_GetModuleOptionsAll)(void) VALKEYMODULE_ATTR;
@@ -2590,7 +2590,7 @@ static int ValkeyModule_Init(ValkeyModuleCtx *ctx, const char *name, int ver, in
     VALKEYMODULE_GET_API(ScanCursorDestroy);
     VALKEYMODULE_GET_API(Scan);
     VALKEYMODULE_GET_API(ScanKey);
-    VALKEYMODULE_GET_API(ScanKeyRawPinned);
+    VALKEYMODULE_GET_API(ScanKeyRawBorrowed);
     VALKEYMODULE_GET_API(GetContextFlagsAll);
     VALKEYMODULE_GET_API(GetModuleOptionsAll);
     VALKEYMODULE_GET_API(GetKeyspaceNotificationFlagsAll);
