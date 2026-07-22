@@ -347,45 +347,6 @@ int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len) {
     return C_OK;
 }
 
-/* Pin a hash field value for zero-copy reply. Detaches the value sds from the
- * entry and converts the entry to a stringRef pointing at the same memory.
- * Returns a RAW_BORROWED robj shell that, when freed by releaseBufReferences,
- * will re-adopt the sds back into the entry (or sdsfree it if entry is gone).
- *
- * Returns NULL if:
- * - encoding is listpack (embedded, cheap to copy)
- * - field not found
- * - entry already is a stringRef (someone else pinned it)
- * - value is embedded in the entry allocation (can't detach)
- *
- * Caller uses the returned robj* directly in addReplyBulk (BULK_STR_REF path). */
-robj *hashTypePinValueForReply(robj *o, sds field) {
-    if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) return NULL;
-
-    hashtable *ht = objectGetVal(o);
-    void **entry_ref = hashtableFindRef(ht, field);
-    if (!entry_ref) return NULL;
-
-    entry *e = *entry_ref;
-
-    /* Embedded (small) values: copy. Safe — read synchronously from the live
-     * entry during the scan; no zero-copy borrow needed for tiny values. */
-    if (entryHasEmbeddedValue(e)) return NULL;
-    /* Module-externalized stringRef: buffer is module-owned; copy. */
-    if (entryHasStringRef(e)) return NULL;
-
-    /* copy1: Type-3 owned sds. Return a RAW_BORROWED shell aliasing the LIVE
-     * buffer. No borrow table tracking — the module will immediately read
-     * ptr+len, reply via ReplyWithStringBuffer (copies), and free the shell,
-     * all synchronously before returning to the event loop. */
-    size_t vlen;
-    char *p = entryGetValue(e, &vlen);
-    if (!p) return NULL;
-    return createBorrowedShellForStringRefPin(o, field, NULL, (sds)p);
-}
-
-/* hashTypeUnpinStringRef REMOVED for copy1 — no borrow table to decrement. */
-
 /* Add a new field, overwrite the old with the new value if it already exists.
  * Return 0 on insert and 1 on update.
  *

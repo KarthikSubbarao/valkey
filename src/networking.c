@@ -264,7 +264,7 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) return 0;
 
     if (obj) {
-        if (obj->encoding != OBJ_ENCODING_RAW && obj->encoding != OBJ_ENCODING_RAW_BORROWED) return 0;
+        if (obj->encoding != OBJ_ENCODING_RAW) return 0;
         if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
     }
 
@@ -1476,7 +1476,7 @@ void addReplyBulk(client *c, robj *obj) {
         /* If copy avoidance allowed, then we explicitly maintain net_output_bytes_curr_cmd.
          * We determine per-reply if tracking is enabled by checking the config in the main thread. */
         if (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1) {
-            serverAssert(obj->encoding == OBJ_ENCODING_RAW || obj->encoding == OBJ_ENCODING_RAW_BORROWED);
+            serverAssert(obj->encoding == OBJ_ENCODING_RAW);
             size_t str_len = sdslen(objectGetVal(obj));
             uint32_t num_len = digits10(str_len);
             /* RESP encodes bulk strings as $<length>\r\n<data>\r\n */

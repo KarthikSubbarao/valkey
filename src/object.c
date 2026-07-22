@@ -583,46 +583,10 @@ robj *createModuleObject(moduleType *mt, void *value) {
     return createObject(OBJ_MODULE, mv);
 }
 
-/* PinBack: metadata stored after the robj shell in a RAW_BORROWED allocation.
- * Layout: [robj shell (32B) | PinBack].
- * B3: the shell only needs the value buffer pointer 'p' to decrement the borrow
- * count on reply completion. The buffer's lifetime is protected by the borrow
- * side table (entryFreeValuePtr defers frees of borrowed buffers), so the shell
- * does NOT pin the hash object and does NOT copy the field. */
-typedef struct PinBack {
-    sds p;              /* The value sds buffer being borrowed */
-} PinBack;
-
 void freeStringObject(robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
         sdsfree(objectGetVal(o));
-    } else if (objectGetEncoding(o) == OBJ_ENCODING_RAW_BORROWED) {
-        /* copy1 borrowed-value shell: no borrow table, no decrement needed.
-         * The module already copied out via ReplyWithStringBuffer before freeing
-         * the shell, so the aliased sds is NOT freed here. */
-        (void)o; /* shell allocation freed by the caller (zfree in decrRefCount) */
     }
-}
-
-/* Create a RAW_BORROWED shell aliasing the LIVE value buffer 'p'.
- * hash_obj/field/sr are unused in B3 (kept in the signature for the caller).
- * Allocation layout: [robj | PinBack]. */
-robj *createBorrowedShellForStringRefPin(robj *hash_obj, sds field, void *sr, sds p) {
-    (void)hash_obj;
-    (void)field;
-    (void)sr;
-    robj *shell = zmalloc(sizeof(robj) + sizeof(PinBack));
-    shell->type = OBJ_STRING;
-    shell->encoding = OBJ_ENCODING_RAW_BORROWED;
-    shell->lru = 0;
-    shell->hasexpire = 0;
-    shell->hasembkey = 0;
-    shell->hasembval = 0;
-    shell->refcount = 1;
-    objectSetVal(shell, p);
-    PinBack *pb = (PinBack *)((char *)shell + sizeof(robj));
-    pb->p = p;
-    return shell;
 }
 
 void freeListObject(robj *o) {

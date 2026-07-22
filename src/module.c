@@ -12035,16 +12035,9 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
         value = createStringObjectFromLongDouble(node->score, 0);
     } else if (objectGetType(o) == OBJ_HASH) {
         key = entryGetField(entry);
-        /* Zero-copy: pin the field value via stringRef detach.
-         * The shell holds a BULK_STR_REF reference; on reply completion,
-         * freeStringObject re-adopts the sds or frees it if entry is gone. */
-        value = hashTypePinValueForReply(o, entryGetField(entry));
-        if (!value) {
-            /* Fallback: embedded value or pin failed — copy */
-            size_t val_len;
-            char *val = entryGetValue(entry, &val_len);
-            value = createStringObject(val, val_len);
-        }
+        size_t val_len;
+        char *val = entryGetValue(entry, &val_len);
+        value = createStringObject(val, val_len);
     } else {
         serverPanic("unexpected object type");
     }
@@ -12057,9 +12050,10 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
 
 /* ScanKeyRawPinned: like ScanKey but for hashes only.
  * Field delivered as raw (const char*, len) -- no name robj.
- * Value delivered as a pinned ValkeyModuleString shell (OBJ_ENCODING_RAW_BORROWED)
- * that the module can reply with directly (BULK_STR_REF zero-copy).
- * If pinning fails (embedded/listpack value), falls back to createStringObject copy. */
+ * Value delivered as a raw borrowed (const char*, len) pair -- no robj, no copy.
+ * The value pointer aliases the live buffer and is valid only for the duration of
+ * the callback/command; the module must copy it out (e.g. ReplyWithStringBuffer)
+ * before returning to the event loop. */
 typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
                                                const char *value, size_t value_len,
