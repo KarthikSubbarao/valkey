@@ -12062,7 +12062,7 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
  * If pinning fails (embedded/listpack value), falls back to createStringObject copy. */
 typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
-                                               ValkeyModuleString *value_shell,
+                                               const char *value, size_t value_len,
                                                void *privdata);
 typedef struct {
     ValkeyModuleKey *key;
@@ -12072,21 +12072,16 @@ typedef struct {
 
 static void moduleScanKeyRawPinnedHashtableCallback(void *privdata, void *entry) {
     ScanKeyRawPinnedCBData *data = privdata;
-    robj *o = data->key->value;
     sds field = entryGetField(entry);
     size_t field_len = sdslen(field);
 
-    /* Pin the value: detach sds, entry becomes stringRef, shell owns the sds */
-    robj *value_shell = hashTypePinValueForReply(o, field);
-    if (!value_shell) {
-        /* Fallback: embedded value or listpack — copy */
-        size_t val_len;
-        char *val = entryGetValue(entry, &val_len);
-        value_shell = createStringObject(val, val_len);
-    }
-
-    data->fn(data->key, field, field_len, value_shell, data->user_data);
-    decrRefCount(value_shell);
+    /* copy1-lean: deliver a BORROWED pointer into the live value (owned sds or
+     * embedded). No robj shell, no RAW_BORROWED, no copy. The module reads
+     * ptr+len and copies into the reply buffer (COPY-2) synchronously within
+     * the command, so the borrow never dangles. */
+    size_t val_len;
+    char *val = entryGetValue(entry, &val_len);
+    data->fn(data->key, field, field_len, val, val_len, data->user_data);
 }
 
 /* VM_ScanKeyRawPinned -- scan a hash key, delivering field as raw bytes and
@@ -12130,9 +12125,12 @@ int VM_ScanKeyRawPinned(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
                 vlen = ll2string(vbuf, sizeof(vbuf), vval);
                 vptr = vbuf;
             }
-            robj *val_obj = createStringObject(vptr, vlen);
-            fn(key, fptr, flen, val_obj, privdata);
-            decrRefCount(val_obj);
+            /* copy1-lean: deliver borrowed ptr+len (no robj). String values
+             * point into the listpack (stable during the read-only command).
+             * NOTE: integer-encoded values point at the stack buffer above --
+             * validated only for hashtable-encoded indexed content (large
+             * values are always hashtable), not listpack-integer. */
+            fn(key, fptr, flen, vptr, vlen, privdata);
             p = lpNext(lp, p);
         }
         cursor->done = 1;

@@ -1497,7 +1497,7 @@ typedef void (*ValkeyModuleScanKeyCB)(ValkeyModuleKey *key,
                                       void *privdata);
 typedef void (*ValkeyModuleScanKeyRawPinnedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
-                                               ValkeyModuleString *value_shell,
+                                               const char *value, size_t value_len,
                                                void *privdata);
 typedef ValkeyModuleString *(*ValkeyModuleConfigGetStringFunc)(const char *name, void *privdata);
 typedef long long (*ValkeyModuleConfigGetNumericFunc)(const char *name, void *privdata);
