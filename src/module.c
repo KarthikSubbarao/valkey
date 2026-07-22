@@ -12104,18 +12104,33 @@ int VM_ScanKeyRawPinned(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
         return 0;
     }
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-        /* Listpack: iterate entries, deliver as raw bytes + copy (cheap, small) */
+        /* Listpack: values are inline (not borrowable sds), so we deliver a
+         * small copy. Entries may be integer-encoded -- lpGetValue returns NULL
+         * and writes the integer to the provided long long*, so we MUST pass a
+         * valid pointer (NOT NULL) and materialize integers into a string. */
         if (cursor->done) { errno = ENOENT; return 0; }
         unsigned char *lp = objectGetVal(o);
         unsigned char *p = lpFirst(lp);
         while (p) {
             unsigned int flen;
-            char *fptr = (char *)lpGetValue(p, &flen, NULL);
+            long long fval;
+            char fbuf[LONG_STR_SIZE];
+            char *fptr = (char *)lpGetValue(p, &flen, &fval);
+            if (fptr == NULL) { /* integer-encoded field name */
+                flen = ll2string(fbuf, sizeof(fbuf), fval);
+                fptr = fbuf;
+            }
             p = lpNext(lp, p);
             if (!p) break;
             unsigned int vlen;
-            char *vptr = (char *)lpGetValue(p, &vlen, NULL);
-            robj *val_obj = createStringObject(vptr ? vptr : "", vptr ? vlen : 0);
+            long long vval;
+            char vbuf[LONG_STR_SIZE];
+            char *vptr = (char *)lpGetValue(p, &vlen, &vval);
+            if (vptr == NULL) { /* integer-encoded value */
+                vlen = ll2string(vbuf, sizeof(vbuf), vval);
+                vptr = vbuf;
+            }
+            robj *val_obj = createStringObject(vptr, vlen);
             fn(key, fptr, flen, val_obj, privdata);
             decrRefCount(val_obj);
             p = lpNext(lp, p);
