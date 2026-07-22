@@ -597,10 +597,10 @@ void freeStringObject(robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
         sdsfree(objectGetVal(o));
     } else if (objectGetEncoding(o) == OBJ_ENCODING_RAW_BORROWED) {
-        /* B3 borrowed-value shell: decrement the borrow count (frees the buffer
-         * only if the owning entry was freed while borrowed). */
-        PinBack *pb = (PinBack *)((char *)o + sizeof(robj));
-        hashTypeUnpinStringRef(NULL, NULL, NULL, pb->p);
+        /* copy1 borrowed-value shell: no borrow table, no decrement needed.
+         * The module already copied out via ReplyWithStringBuffer before freeing
+         * the shell, so the aliased sds is NOT freed here. */
+        (void)o; /* shell allocation freed by the caller (zfree in decrRefCount) */
     }
 }
 

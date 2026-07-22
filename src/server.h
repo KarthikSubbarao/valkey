@@ -3617,7 +3617,6 @@ bool hashTypeHasVolatileFields(robj *o);
 int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len);
 bool hashTypeHasStringRef(robj *o, sds field);
 robj *hashTypePinValueForReply(robj *o, sds field);
-void hashTypeUnpinStringRef(robj *o, sds field, void *sr, sds p);
 
 /* Pub / Sub */
 int pubsubUnsubscribeAllChannels(client *c, int notify);

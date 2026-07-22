@@ -167,70 +167,11 @@ char *entryGetValue(const entry *entry, size_t *len) {
     return *value_ref;
 }
 
-/* ---- B3 hash-value borrow side table (main-thread only; empty at rest) ------
- * Tracks the value sds buffers that in-flight zero-copy FT.SEARCH replies are
- * currently reading. A concurrent free (HSET overwrite / HDEL / DEL / FLUSH /
- * field expiry) consults this table: if the buffer is being read, the free is
- * DEFERRED to the reply's completion instead of freed under the io-thread write.
- * The hash entry itself is never mutated (stays Type-3). The table is empty when
- * no reply is in flight, so there is zero memory overhead at rest. */
-typedef struct hashBorrow {
-    const void *buf;    /* value sds buffer being borrowed (the lookup key) */
-    uint32_t count;     /* number of in-flight replies reading it */
-    uint8_t wantfree;   /* the owning entry has since been freed/overwritten */
-} hashBorrow;
-static const void *hashBorrowGetKey(const void *entry) { return ((const hashBorrow *)entry)->buf; }
-static hashtableType hashBorrowType = {.entryGetKey = hashBorrowGetKey};
-static hashtable *g_hashBorrow = NULL;
-
-/* Reply-append: one more in-flight reply is reading buf. */
-void hashValueBorrowIncr(const void *buf) {
-    if (!g_hashBorrow) g_hashBorrow = hashtableCreate(&hashBorrowType);
-    void *found;
-    if (hashtableFind(g_hashBorrow, buf, &found)) {
-        ((hashBorrow *)found)->count++;
-    } else {
-        hashBorrow *b = zmalloc(sizeof(*b));
-        b->buf = buf;
-        b->count = 1;
-        b->wantfree = 0;
-        hashtableAdd(g_hashBorrow, b);
-    }
-}
-
-/* Reply-done: one fewer in-flight reply. Returns 1 if the caller must now
- * sdsfree(buf) (count reached 0 AND the owning entry already requested free). */
-int hashValueBorrowDecr(const void *buf) {
-    if (!g_hashBorrow) return 0;
-    void *found;
-    if (!hashtableFind(g_hashBorrow, buf, &found)) return 0;
-    hashBorrow *b = found;
-    if (--b->count > 0) return 0;
-    int must_free = b->wantfree;
-    hashtableDelete(g_hashBorrow, buf);
-    zfree(b);
-    return must_free;
-}
-
-/* Entry free path: if buf is currently borrowed, mark it free-wanted and return
- * 1 (caller must NOT free now — the last reply-done frees it). Returns 0 if not
- * borrowed (caller frees now, as usual). */
-int hashValueBorrowRequestFree(const void *buf) {
-    if (!g_hashBorrow) return 0;
-    void *found;
-    if (!hashtableFind(g_hashBorrow, buf, &found)) return 0;
-    ((hashBorrow *)found)->wantfree = 1;
-    return 1;
-}
-
-/* Read-only: is this value buffer currently borrowed by an in-flight reply?
- * Used by active defrag to SKIP relocating a borrowed buffer (a move would
- * dangle the borrow-table key and the reply shell's pointer -> UAF). */
-int hashValueIsBorrowed(const void *buf) {
-    if (!g_hashBorrow) return 0;
-    void *found;
-    return hashtableFind(g_hashBorrow, buf, &found) ? 1 : 0;
-}
+/* B3 borrow side table REMOVED for copy1 variant (COPY-1 only, no safety net).
+ * The borrowed shell is short-lived: scan returns it, module reads ptr+len,
+ * module replies via ReplyWithStringBuffer (copies into reply buf), then frees
+ * the shell. No concurrent free hazard in this path because the scan+reply
+ * happen synchronously on the main thread before returning to the event loop. */
 
 /* Frees the entry's non-embedded value.
  * If the value is a string reference (stringRef), only the entry's pointer
@@ -245,8 +186,8 @@ static void entryFreeValuePtr(entry *entry) {
          * (non-owned) stringRef struct. */
         zfree(*value_ref);
     } else {
-        /* Type-3 owned sds. Defer if a reply is reading it, else free now. */
-        if (!hashValueBorrowRequestFree(*value_ref)) sdsfree(*value_ref);
+        /* Type-3 owned sds. Free now. (copy1: no borrow table) */
+        sdsfree(*value_ref);
     }
     *value_ref = NULL;
 }
@@ -594,15 +535,9 @@ entry *entryDefrag(entry *e, void *(*defragfn)(void *), sds (*sdsdefragfn)(sds))
         if (new_value) *value_ref = new_value;
     } else if (entryHasValuePtr(e)) {
         sds *value_ref = (sds *)entryGetValueRef(e);
-        /* B3: never MOVE a value buffer that an in-flight reply is borrowing —
-         * the borrow table + reply shell reference it by address, and B3 only
-         * defers frees, not moves. Skip relocating it this cycle; a later defrag
-         * pass will move it once the borrow clears. Moving the entry allocation
-         * below is still fine (the value buffer is a separate allocation). */
-        if (!hashValueIsBorrowed(*value_ref)) {
-            sds new_value = sdsdefragfn(*value_ref);
-            if (new_value) *value_ref = new_value;
-        }
+        /* copy1: no borrow table, defrag unconditionally. */
+        sds new_value = sdsdefragfn(*value_ref);
+        if (new_value) *value_ref = new_value;
     }
     char *allocation = entryGetAllocPtr(e);
     char *new_allocation = defragfn(allocation);

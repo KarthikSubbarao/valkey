@@ -58,14 +58,7 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry);
  * An external mechanism must handle the eventual memory deallocation of `buf`. */
 entry *entryUpdateAsStringRef(entry *entry, const char *buf, size_t len, mstime_t expiry);
 
-/* B3 hash-value borrow side table (zero-copy reply safety; main-thread only).
- * incr on reply-append, decr on reply-done (returns 1 if caller must sdsfree buf),
- * requestFree on entry free (returns 1 if borrowed -> caller must NOT free now). */
-void hashValueBorrowIncr(const void *buf);
-int hashValueBorrowDecr(const void *buf);
-int hashValueBorrowRequestFree(const void *buf);
-/* Read-only borrow check for active defrag (skip relocating borrowed buffers). */
-int hashValueIsBorrowed(const void *buf);
+/* B3 borrow side table REMOVED for copy1 variant. */
 
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.

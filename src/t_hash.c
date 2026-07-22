@@ -374,30 +374,17 @@ robj *hashTypePinValueForReply(robj *o, sds field) {
     /* Module-externalized stringRef: buffer is module-owned; copy. */
     if (entryHasStringRef(e)) return NULL;
 
-    /* B3: Type-3 owned sds. Do NOT mutate the entry. Mark the value buffer as
-     * borrowed in the side table and hand back a RAW_BORROWED shell aliasing the
-     * LIVE buffer. A concurrent free of this field will consult the table and
-     * defer (entryFreeValuePtr -> hashValueBorrowRequestFree). The reply's
-     * completion (hashTypeUnpinStringRef) decrements and frees if it was the
-     * last holder of a freed value. The shell also refcount-pins the hash object
-     * so DEL/FLUSH of the whole key can't free it mid-reply. */
+    /* copy1: Type-3 owned sds. Return a RAW_BORROWED shell aliasing the LIVE
+     * buffer. No borrow table tracking — the module will immediately read
+     * ptr+len, reply via ReplyWithStringBuffer (copies), and free the shell,
+     * all synchronously before returning to the event loop. */
     size_t vlen;
     char *p = entryGetValue(e, &vlen);
     if (!p) return NULL;
-    hashValueBorrowIncr(p);
     return createBorrowedShellForStringRefPin(o, field, NULL, (sds)p);
 }
 
-/* Reply-done for a B3-borrowed value (from freeStringObject when the shell is
- * freed after the io-thread write completes). Decrement the borrow count; if the
- * owning entry was freed/overwritten while borrowed (wantfree) and this was the
- * last reader, free the buffer now. Never mutates the entry. */
-void hashTypeUnpinStringRef(robj *o, sds field, void *sr_ptr, sds p) {
-    (void)o;
-    (void)field;
-    (void)sr_ptr;
-    if (hashValueBorrowDecr(p)) sdsfree(p);
-}
+/* hashTypeUnpinStringRef REMOVED for copy1 — no borrow table to decrement. */
 
 /* Add a new field, overwrite the old with the new value if it already exists.
  * Return 0 on insert and 1 on update.
