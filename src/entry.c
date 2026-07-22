@@ -167,26 +167,16 @@ char *entryGetValue(const entry *entry, size_t *len) {
     return *value_ref;
 }
 
-/* B3 borrow side table REMOVED for copy1 variant (COPY-1 only, no safety net).
- * The borrowed shell is short-lived: scan returns it, module reads ptr+len,
- * module replies via ReplyWithStringBuffer (copies into reply buf), then frees
- * the shell. No concurrent free hazard in this path because the scan+reply
- * happen synchronously on the main thread before returning to the event loop. */
-
 /* Frees the entry's non-embedded value.
  * If the value is a string reference (stringRef), only the entry's pointer
  * is freed, as the underlying string is not owned by this entry.
- * Otherwise, the value is a standard SDS. B3: if an in-flight zero-copy reply is
- * borrowing that buffer, defer the free (the reply's completion frees it). */
+ * Otherwise, the value is a standard SDS and is fully freed. */
 static void entryFreeValuePtr(entry *entry) {
     serverAssert(entryHasValuePtr(entry));
     void **value_ref = entryGetValueRef(entry);
     if (entryHasStringRef(entry)) {
-        /* Module-externalized stringRef: buffer is module-owned; free only the
-         * (non-owned) stringRef struct. */
         zfree(*value_ref);
     } else {
-        /* Type-3 owned sds. Free now. (copy1: no borrow table) */
         sdsfree(*value_ref);
     }
     *value_ref = NULL;
@@ -535,7 +525,6 @@ entry *entryDefrag(entry *e, void *(*defragfn)(void *), sds (*sdsdefragfn)(sds))
         if (new_value) *value_ref = new_value;
     } else if (entryHasValuePtr(e)) {
         sds *value_ref = (sds *)entryGetValueRef(e);
-        /* copy1: no borrow table, defrag unconditionally. */
         sds new_value = sdsdefragfn(*value_ref);
         if (new_value) *value_ref = new_value;
     }

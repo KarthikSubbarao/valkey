@@ -9,9 +9,6 @@
 #include "util.h"
 #include <stdbool.h>
 
-/* Forward declaration */
-struct stringRef;
-
 /*-----------------------------------------------------------------------------
  * Entry
  *----------------------------------------------------------------------------*/
@@ -57,8 +54,6 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry);
  * The reference points to the provided `buf` but does not assume ownership.
  * An external mechanism must handle the eventual memory deallocation of `buf`. */
 entry *entryUpdateAsStringRef(entry *entry, const char *buf, size_t len, mstime_t expiry);
-
-/* B3 borrow side table REMOVED for copy1 variant. */
 
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.

@@ -12048,12 +12048,27 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
     if (value) decrRefCount(value);
 }
 
-/* ScanKeyRawBorrowed: like ScanKey but for hashes only.
- * Field delivered as raw (const char*, len) -- no name robj.
- * Value delivered as a raw borrowed (const char*, len) pair -- no robj, no copy.
- * The value pointer aliases the live buffer and is valid only for the duration of
- * the callback/command; the module must copy it out (e.g. ReplyWithStringBuffer)
- * before returning to the event loop. */
+/* ScanKeyRawBorrowed: like VM_ScanKey, but delivers each element as a raw
+ * (const char *, size_t) pair instead of allocating a ValkeyModuleString per
+ * element. Generic across SET / HASH / ZSET (all encodings).
+ *
+ * Per element the callback receives (field, value):
+ *   - HASH: field = field name, value = field value.
+ *   - SET:  field = member,     value = NULL, value_len = 0 (sets have no value).
+ *   - ZSET: field = member,     value = score in decimal string form.
+ *
+ * LIFETIME CONTRACT:
+ *   - A pointer to a STORED string element (hash field & string value, set
+ *     string member, zset string member; hashtable- and listpack-string-encoded)
+ *     ALIASES the live keyspace buffer and stays valid until the key is next
+ *     modified -- i.e. for the duration of a read-only command. Callers may
+ *     retain it across the scan and reply later within the same command; to keep
+ *     it beyond that they MUST copy it.
+ *   - A pointer to a MATERIALIZED numeric (intset integer member, listpack
+ *     integer-encoded field/value, zset score) points into a CALLBACK-LOCAL
+ *     buffer valid ONLY for that single callback invocation. Callers that retain
+ *     it past the callback MUST copy it.
+ * No robj is allocated for any element and stored string values are never copied. */
 typedef void (*ValkeyModuleScanKeyRawBorrowedCB)(ValkeyModuleKey *key,
                                                const char *field, size_t field_len,
                                                const char *value, size_t value_len,
@@ -12064,82 +12079,136 @@ typedef struct {
     ValkeyModuleScanKeyRawBorrowedCB fn;
 } ScanKeyRawBorrowedCBData;
 
+/* Hashtable-encoded SET / HASH / ZSET(skiplist) callback: borrowed field/member
+ * (+ borrowed hash value, or materialized zset score). */
 static void moduleScanKeyRawBorrowedHashtableCallback(void *privdata, void *entry) {
     ScanKeyRawBorrowedCBData *data = privdata;
-    sds field = entryGetField(entry);
-    size_t field_len = sdslen(field);
-
-    /* copy1-lean: deliver a BORROWED pointer into the live value (owned sds or
-     * embedded). No robj shell, no RAW_BORROWED, no copy. The module reads
-     * ptr+len and copies into the reply buffer (COPY-2) synchronously within
-     * the command, so the borrow never dangles. */
-    size_t val_len;
-    char *val = entryGetValue(entry, &val_len);
-    data->fn(data->key, field, field_len, val, val_len, data->user_data);
+    robj *o = data->key->value;
+    if (objectGetType(o) == OBJ_SET) {
+        sds member = entry;
+        data->fn(data->key, member, sdslen(member), NULL, 0, data->user_data);
+    } else if (objectGetType(o) == OBJ_ZSET) {
+        zskiplistNode *node = (zskiplistNode *)entry;
+        sds member = zslGetNodeElement(node);
+        char scorebuf[MAX_D2STRING_CHARS]; /* materialized: callback-scoped */
+        int slen = d2string(scorebuf, sizeof(scorebuf), node->score);
+        data->fn(data->key, member, sdslen(member), scorebuf, (size_t)slen, data->user_data);
+    } else if (objectGetType(o) == OBJ_HASH) {
+        sds field = entryGetField(entry);
+        size_t val_len;
+        char *val = entryGetValue(entry, &val_len);
+        data->fn(data->key, field, sdslen(field), val, val_len, data->user_data);
+    } else {
+        serverPanic("unexpected object type in ScanKeyRawBorrowed");
+    }
 }
 
-/* VM_ScanKeyRawBorrowed -- scan a hash key, delivering field as raw bytes and
- * value as a pinned (zero-copy safe) ValkeyModuleString shell.
- * Hash-only. Returns 1 if more elements to scan, 0 when done. */
+/* VM_ScanKeyRawBorrowed -- generic raw/borrowed scan of a SET / HASH / ZSET key,
+ * mirroring VM_ScanKey but delivering borrowed (field,value) byte ranges (see the
+ * ValkeyModuleScanKeyRawBorrowedCB lifetime contract) with no per-element robj
+ * allocation and no copy of stored string values.
+ * Returns 1 if more elements remain (call again), 0 when done. On return 0,
+ * errno distinguishes: EINVAL = NULL/wrong-type key, ENOENT = cursor already
+ * exhausted, 0 = normal completion. */
 int VM_ScanKeyRawBorrowed(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor,
-                        ValkeyModuleScanKeyRawBorrowedCB fn, void *privdata) {
+                          ValkeyModuleScanKeyRawBorrowedCB fn, void *privdata) {
     if (key == NULL || key->value == NULL) {
         errno = EINVAL;
         return 0;
     }
+    hashtable *ht = NULL;
     robj *o = key->value;
-    if (objectGetType(o) != OBJ_HASH) {
+    if (objectGetType(o) == OBJ_SET) {
+        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
+    } else if (objectGetType(o) == OBJ_HASH) {
+        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
+    } else if (objectGetType(o) == OBJ_ZSET) {
+        if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST) ht = ((zset *)objectGetVal(o))->ht;
+    } else {
         errno = EINVAL;
         return 0;
     }
-    if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-        /* Listpack: values are inline (not borrowable sds), so we deliver a
-         * small copy. Entries may be integer-encoded -- lpGetValue returns NULL
-         * and writes the integer to the provided long long*, so we MUST pass a
-         * valid pointer (NOT NULL) and materialize integers into a string. */
-        if (cursor->done) { errno = ENOENT; return 0; }
+    if (cursor->done) {
+        errno = ENOENT;
+        return 0;
+    }
+    int ret = 1;
+    if (ht) {
+        /* hashtable-encoded set/hash, or skiplist-encoded zset: incremental. */
+        ScanKeyRawBorrowedCBData data = {key, privdata, fn};
+        cursor->cursor = hashtableScan(ht, cursor->cursor, moduleScanKeyRawBorrowedHashtableCallback, &data);
+        if (cursor->cursor == 0) {
+            cursor->done = 1;
+            ret = 0;
+        }
+    } else if (objectGetType(o) == OBJ_SET) {
+        /* intset / listpack set: full scan. Listpack members are borrowed;
+         * intset integer members are materialized (callback-scoped). */
+        setTypeIterator *si = setTypeInitIterator(o);
+        char *str;
+        size_t len;
+        int64_t llele;
+        char intbuf[LONG_STR_SIZE];
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            const char *m;
+            size_t mlen;
+            if (str != NULL) {
+                m = str;
+                mlen = len;
+            } else {
+                mlen = (size_t)ll2string(intbuf, sizeof(intbuf), llele);
+                m = intbuf;
+            }
+            fn(key, m, mlen, NULL, 0, privdata);
+        }
+        setTypeReleaseIterator(si);
+        cursor->cursor = 1;
+        cursor->done = 1;
+        ret = 0;
+    } else {
+        /* listpack-encoded zset or hash: (field/member, value/score) pairs.
+         * String entries are borrowed; integer-encoded entries are materialized
+         * (callback-scoped). Integers may be either field or value. */
         unsigned char *lp = objectGetVal(o);
-        unsigned char *p = lpFirst(lp);
+        unsigned char *p = lpSeek(lp, 0);
         while (p) {
             unsigned int flen;
-            long long fval;
+            long long fll;
             char fbuf[LONG_STR_SIZE];
-            char *fptr = (char *)lpGetValue(p, &flen, &fval);
-            if (fptr == NULL) { /* integer-encoded field name */
-                flen = ll2string(fbuf, sizeof(fbuf), fval);
-                fptr = fbuf;
+            unsigned char *fstr = lpGetValue(p, &flen, &fll);
+            const char *fp;
+            size_t fl;
+            if (fstr != NULL) {
+                fp = (char *)fstr;
+                fl = flen;
+            } else {
+                fl = (size_t)ll2string(fbuf, sizeof(fbuf), fll);
+                fp = fbuf;
             }
             p = lpNext(lp, p);
             if (!p) break;
             unsigned int vlen;
-            long long vval;
+            long long vll;
             char vbuf[LONG_STR_SIZE];
-            char *vptr = (char *)lpGetValue(p, &vlen, &vval);
-            if (vptr == NULL) { /* integer-encoded value */
-                vlen = ll2string(vbuf, sizeof(vbuf), vval);
-                vptr = vbuf;
+            unsigned char *vstr = lpGetValue(p, &vlen, &vll);
+            const char *vp;
+            size_t vl;
+            if (vstr != NULL) {
+                vp = (char *)vstr;
+                vl = vlen;
+            } else {
+                vl = (size_t)ll2string(vbuf, sizeof(vbuf), vll);
+                vp = vbuf;
             }
-            /* copy1-lean: deliver borrowed ptr+len (no robj). String values
-             * point into the listpack (stable during the read-only command).
-             * NOTE: integer-encoded values point at the stack buffer above --
-             * validated only for hashtable-encoded indexed content (large
-             * values are always hashtable), not listpack-integer. */
-            fn(key, fptr, flen, vptr, vlen, privdata);
+            fn(key, fp, fl, vp, vl, privdata);
             p = lpNext(lp, p);
         }
+        cursor->cursor = 1;
         cursor->done = 1;
-        return 0;
+        ret = 0;
     }
-    /* Hashtable encoding */
-    if (cursor->done) { errno = ENOENT; return 0; }
-    hashtable *ht = objectGetVal(o);
-    ScanKeyRawBorrowedCBData data = {key, privdata, fn};
-    cursor->cursor = hashtableScan(ht, cursor->cursor, moduleScanKeyRawBorrowedHashtableCallback, &data);
-    if (cursor->cursor == 0) {
-        cursor->done = 1;
-        return 0;
-    }
-    return 1;
+    errno = 0;
+    return ret;
 }
 
 /* Scan api that allows a module to scan the elements in a hash, set or sorted set key
